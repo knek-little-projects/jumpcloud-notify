@@ -1,3 +1,5 @@
+{% set config = salt.pillar.get('jumpcloud-notify', {}) %}
+
 requirements:
   pkg.installed:
     - pkgs:
@@ -16,7 +18,7 @@ config:
     - name: /etc/jumpcloud-notify.yaml
     - mode: 600
     - contents: |
-        {{ salt.pillar.get('jumpcloud-notify', {}) | yaml(False) | indent(8) }}
+        {{ config | yaml(False) | indent(8) }}
 
 binary:
   file.managed:
