@@ -11,8 +11,8 @@ Notification examles:
 Deploy
 ------
 
-It is wrapped in saltstack formula. You need to attach a config pillar,
-see example `pillar-example.yaml`.
+It is wrapped in saltstack formula. You need to setup a config pillar: 
+see variable `config` at `init.sls` and a pillar example at `pillar-example.yaml`.
 
 Formula was written for Debian 9.
 
