@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+from requests.adapters import HTTPAdapter, Retry
+from typing import *
+from ipaddress import IPv4Address, IPv6Address
+from itertools import zip_longest
+from queue import Queue
+from collections import Counter
+import threading
+import yaml
+import json
+import requests
+import time
+import logging
+import traceback
+import sqlite3
+import difflib
+import sys
+
+config = yaml.safe_load(open(sys.argv[1] if len(sys.argv) > 1 else "config.yaml").read())
+logging.basicConfig(**config["logging"])
+tg_queue = Queue()  # очередь сообщений на отправку в телеграм
+db = sqlite3.connect(config["state_file"], isolation_level=None)
+db.execute("create table if not exists alerts (msg text, ts int)")
+db.execute("create table if not exists storage (data text)")
+
+
+def execute(sql, *args):
+    return db.execute(sql, args)
+
+
+def one(l, default):
+    return next(l, (default,))[0]
+
+
+def timestamp():
+    return int(time.time())
+
+
+def get_age(msg) -> int:
+    """
+    Как давно был отправлен указанный алерт
+    """
+    execute("delete from alerts where ts < ?", timestamp() - config["max_realert_timeout"])
+    return timestamp() - one(execute("select ts from alerts where msg = ?", msg), 0)
+
+
+def set_age(msg):
+    """
+    Обновить дату отправления алерта
+    """
+    execute("delete from alerts where msg = ?", msg)
+    execute("insert into alerts values (?, ?)", msg, timestamp())
+
+
+def get_storage() -> dict:
+    """
+    Последнее состояние JumpCloud в базе данных
+    """
+    return json.loads(one(execute("select * from storage limit 1"), "{}"))
+
+
+def set_storage(data: dict):
+    """
+    Выставить состояние JumpCloud в базе данных
+    """
+    execute("delete from storage")
+    execute("insert into storage values (?)", json.dumps(data))
+
+
+def split_chunks(text: str, max_size: int) -> Iterator[str]:
+    """
+    Телеграм sendMessage API имеет ограничение на величину сообщения в 4096 символов.
+    Функция возвращает итератор на куски оригинального текста, так чтобы каждый кусок
+    вписывался в ограничение.
+    """
+    for chunk in zip_longest(*[iter(text)] * max_size, fillvalue=""):
+        yield "".join(chunk)
+
+
+def telegram_thread(token, chat, connection_timeout, wait_on_error=60, max_msg_size=4000, enabled=True):
+    """
+    Бесконечно пытаться послать сообщения из очереди в телеграм
+    """
+    url = "https://api.telegram.org/bot{token}/sendMessage".format(token=token)
+    logging.debug("Started telegram sender (connection timeout = {connection_timeout})".format(connection_timeout=connection_timeout))
+    while True:
+        msg = str(tg_queue.get())
+        if enabled:
+            logging.info("Telegram send: " + msg)
+
+            for chunk in split_chunks(msg, max_msg_size):
+                while True:
+                    logging.debug("Trying to send chunk size %s:\n%s" % (len(chunk), chunk))
+                    logging.debug("Tg queue size %s" % tg_queue.qsize())
+                    try:
+                        response = requests.post(url, json={"chat_id": chat, "text": chunk}, headers={"Connection": "close"}, timeout=connection_timeout)
+                        if response.status_code != 200:
+                            raise Exception("{code}: {text}".format(code=response.status_code, text=response.text))
+
+                        time.sleep(3)  # max limit - 20 msgs per 1 minute
+                        break
+                    except KeyboardInterrupt:
+                        return
+
+                    except Exception as e:
+                        logging.error(str(e).replace(token, "***"))
+                        time.sleep(wait_on_error)
+
+
+def notify(text: str):
+    """
+    Вывести текст на экран и отправить в телеграм
+    """
+    logging.warning(text)
+    tg_queue.put_nowait(text)
+
+
+def alert(text, realert_timeout=config["realert_timeout"]):
+    """
+    Вывести алерт на экран, но не повторять чаще указанного периода
+
+    :param text:            текст алерта
+    :param realert_timeout: повторять один и тот же алерт не чаще этого кол-ва секунд
+    """
+    text = str(text)
+    if get_age(text) > realert_timeout:
+        set_age(text)
+        notify(text)
+
+
+def get(path):
+    """
+    Обратиться к JumpCloud API и получить JSON
+
+    :param path: путь от корня сайта с начальным слэшем, например - /path/to/api
+    :return:     json
+    """
+    with requests.Session() as session:
+        session.mount("https://", HTTPAdapter(max_retries=Retry(backoff_factor=60)))
+        response = session.get("https://console.jumpcloud.com" + path, headers={"x-api-key": config["api_key"]})
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            raise Exception("JumpCloud API failed to parse JSON response: [%s] %s" % (response.status_code, response.text))
+
+
+def check_system_dangerous_params(system):
+    hostname = system["hostname"]
+    for ip_info in system["networkInterfaces"]:
+        address = ip_info["address"]
+        if [hostname, address] not in config["ignore_hostname_ip"]:
+            family = ip_info["family"]
+            ip = IPv4Address(address) if family == "IPv4" else IPv6Address(address)
+            if ip.is_global:
+                alert('System "{hostname}" has a global ip address: "{address}"'.format(address=address, hostname=hostname))
+
+    for key, value in config["dangerous_system_params"].items():
+        if system[key] == value:
+            alert('System "{hostname}" has dangerous param: "{key}={value}"'.format(hostname=hostname, key=key, value=value))
+
+    for argval in system["sshdParams"]:
+        key, value = argval["name"], argval["value"]
+        if config["dangerous_sshd_params"].get(key) == value:
+            alert('System "{hostname}" has dangerous sshd param: "{key}={value}"'.format(hostname=hostname, key=key, value=value))
+
+
+def check_user_dangerous_params(user):
+    email = user["email"]
+    if not user["account_locked"]:
+        for key, val in config["dangerous_user_params"].items():
+            if user[key] == val:
+                alert('User "{email}" has dangerous param: "{key}={val}"'.format(email=email, key=key, val=val))
+
+        if not user.get("mfa", {}).get("configured"):
+            alert('User "{email}" MFA unconfigured'.format(email=email))
+
+
+def check_dangerous_params(jumpcloud_state):
+    for user in jumpcloud_state["users"]:
+        if user["email"] not in config["ignore_dangerous_params_for_users"]:
+            check_user_dangerous_params(user)
+
+    for system in jumpcloud_state["systems"]:
+        check_system_dangerous_params(system)
+
+
+def index(key: str, items: Iterator[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    result = {}
+    counter = Counter()
+    for item in items:
+        uid = item.get(key, "")
+        if uid in result:
+            counter[uid] += 1
+            uid += " ⊕ " + str(counter[uid])
+
+        result[uid] = item
+
+    return result
+
+
+def walk_user_systems(user_id, system_id_hostname):
+    for system in get("/api/v2/users/%s/systems" % user_id):
+        yield {"hostname": system_id_hostname.get(system["id"], "Can't detect! :-(")}
+
+
+def walk_users(systems):
+    system_id_hostname = {system["_id"]: system["hostname"] for system in systems}
+    for user in get("/api/systemusers")["results"]:
+        user["groups"] = get("/api/v2/users/%s/memberof" % user['_id'])
+        user["systems"] = list(walk_user_systems(user['_id'], system_id_hostname))
+        yield user
+
+
+def get_jumpcloud_data():
+    systems = get("/api/systems")["results"]
+    return {
+        "cmd_results": get("/api/commandresults/")["results"],
+        "apps": get("/api/applications/")["results"],
+        "commands": index("name", get("/api/commands/")["results"]),
+        "groups": index("name", get("/api/v2/groups")),
+        "users": index("email", walk_users(systems)),
+        "systems": index("hostname", systems),
+    }
+
+
+def walk_json_diff(a, b, titles: List[str], msg_sep="", title_sep=" → ") -> Iterator[str]:
+    """
+    Рекурсивно сравнить два JSON одинаковой схемы и вернуть текстовое представление их отличий
+
+    :param a:           json 1
+    :param b:           json 2
+    :param titles:      последовательность заголовков, которые должны обрамлять описание различий
+    :param msg_sep:     текстовый разделитель между кусками различий
+    :param title_sep:   разделитель при склеивании заголовков
+    :return:            итаратор на строки, описывающие различия между json 1 и json 2
+    """
+    title = title_sep.join(titles) + ":"
+    if a != b:
+        if a is None or b is None:
+            sign = '+' if a is None else '-'
+            yield title
+            yield from (sign + " " + line for line in json.dumps(a or b, indent=2).splitlines())
+            yield msg_sep
+
+        elif isinstance(a, dict) and isinstance(b, dict):
+            for key in set(a) | set(b):
+                if key not in config["ignore_leaves"]:
+                    yield from walk_json_diff(a.get(key), b.get(key), titles + [key])
+
+        else:
+            yield title
+            yield from (l for l in difflib.ndiff(json.dumps(a, indent=2).splitlines(), json.dumps(b, indent=2).splitlines()) if l[0] in "+-")
+            yield msg_sep
+
+
+def json_diff(a, b) -> str:
+    return "\n".join(walk_json_diff(a, b, []))
+
+
+threading.Thread(target=telegram_thread, kwargs=config['telegram'], daemon=True).start()
+
+while True:
+    # работаем в бесконечном цикле в качестве демона
+    try:
+        old = get_storage() or get_jumpcloud_data()
+        while True:
+            # бесконечно сравниваем старое состояние с новым и алертим изменения
+            new = get_jumpcloud_data()
+            diff = json_diff(old, new)
+            if diff:
+                notify(diff)
+                set_storage(new)
+                old = new
+
+            time.sleep(1)
+            logging.debug("--- new cycle ---")
+
+    except KeyboardInterrupt:
+        exit(1)
+
+    except Exception as e:
+        # не даём программе вылетить, какая бы ошибка не случилась
+        tb = "\n".join(traceback.format_exception(Exception, e, e.__traceback__))
+        logging.critical(tb)
+        alert(e, realert_timeout=60)

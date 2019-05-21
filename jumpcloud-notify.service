@@ -1,0 +1,16 @@
+[Unit]
+Description=JumpCloud Notify Service
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+User=root
+WorkingDirectory=/root/.jumpcloud-notify
+ExecStart=/usr/bin/jumpcloud-notify /etc/jumpcloud-notify.yaml
+SyslogIdentifier=jumpcloud-notify
+
+[Install]
+WantedBy=multi-user.target

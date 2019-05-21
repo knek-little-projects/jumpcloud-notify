@@ -1,0 +1,55 @@
+jumpcloud-notify:
+  api_key: JUMPCLOUD_API_KEY
+
+  telegram:
+    enabled: true
+    token: TELEGRAM_BOT_TOKEN
+    chat: TELEGRAM_CHAT_ID
+    connection_timeout: 5
+    wait_on_error: 60
+
+  state_file: state.sqlite
+  realert_timeout: 86400
+  max_realert_timeout: 86400
+
+  logging:
+    format: "%(asctime)s %(name)s[%(process)d] %(levelname)s %(message)s"
+    level: 30  # WARNING
+
+  ignore_hostname_ip:
+    - - localhost
+      - 127.0.0.1
+
+  ignore_leaves:
+    - remoteIP
+    - networkInterfaces
+    - lastContact
+
+  ignore_dangerous_params_for_users:
+    - security@ibclabs.com
+
+  dangerous_user_params:
+    enable_user_portal_multifactor: false
+    password_never_expires: true
+    passwordless_sudo: true
+    sudo: true
+    totp_enabled: false
+
+  dangerous_sshd_params:
+    ChallengeResponseAuthentication: "no"
+    UsePAM: "no"
+    PubkeyAuthentication: "no"
+    PermitRootLogin: "yes"
+    PasswordAuthentication: "yes"
+    HostbasedAuthentication: "yes"
+    PermitEmptyPasswords: "yes"
+    IgnoreRhosts: "no"
+    PermitUserEnvironment: "yes"
+    UsePrivilegeSeparation: "no"
+
+  dangerous_system_params:
+    sshRootEnabled: true
+    allowSshPasswordAuthentication: true
+    allowSshRootLogin: true
+    allowMultiFactorAuthentication: false
+    allowPublicKeyAuthentication: false
