@@ -9,7 +9,7 @@ Restart=always
 RestartSec=1
 User=root
 WorkingDirectory=/root/.jumpcloud-notify
-ExecStart=/usr/bin/jumpcloud-notify /etc/jumpcloud-notify.yaml
+ExecStart=/usr/bin/jumpcloud-notify -d -c /etc/jumpcloud-notify.yaml
 SyslogIdentifier=jumpcloud-notify
 
 [Install]
