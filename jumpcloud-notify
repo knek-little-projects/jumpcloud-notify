@@ -9,6 +9,7 @@ import threading
 import yaml
 import json
 import requests
+import argparse
 import time
 import logging
 import traceback
@@ -16,7 +17,14 @@ import sqlite3
 import difflib
 import sys
 
-config = yaml.safe_load(open(sys.argv[1] if len(sys.argv) > 1 else "config.yaml").read())
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-c", "--config", help="config.yaml path", type=str, default="config.yaml")
+parser.add_argument("-p", "--print", help="print fresh JumpCloud state and exit", action="store_true")
+parser.add_argument("-d", "--daemon", help="run daemon", action="store_true")
+args = parser.parse_args()
+
+config = yaml.safe_load(open(args.config).read())
 logging.basicConfig(**config["logging"])
 tg_queue = Queue()  # очередь сообщений на отправку в телеграм
 db = sqlite3.connect(config["state_file"], isolation_level=None)
@@ -199,25 +207,30 @@ def index(key: str, items: Iterator[Dict[str, Any]]) -> Dict[str, Dict[str, Any]
 
 
 def walk_user_systems(user_id, system_id_hostname):
-    for system in get("/api/v2/users/%s/systems" % user_id):
+    for system in get("/api/v2/users/%s/systems?limit=100" % user_id):
         yield {"hostname": system_id_hostname.get(system["id"], "Can't detect! :-(")}
 
 
 def walk_users(systems):
     system_id_hostname = {system["_id"]: system["hostname"] for system in systems}
-    for user in get("/api/systemusers")["results"]:
-        user["groups"] = get("/api/v2/users/%s/memberof" % user['_id'])
+    for user in get("/api/systemusers?limit=100")["results"]:
+        user["groups"] = get("/api/v2/users/%s/memberof?limit=100" % user['_id'])
         user["systems"] = list(walk_user_systems(user['_id'], system_id_hostname))
         yield user
 
 
 def get_jumpcloud_data():
+    """
+    Получить JSON со всеми данными в JumpCloud
+
+    NOTE: Не сделал пагинацию. Лимиты установлены в 100.
+    """
     systems = get("/api/systems")["results"]
     return {
         "cmd_results": get("/api/commandresults/")["results"],
         "apps": get("/api/applications/")["results"],
         "commands": index("name", get("/api/commands/")["results"]),
-        "groups": index("name", get("/api/v2/groups")),
+        "groups": index("name", get("/api/v2/groups?limit=100")),
         "users": index("email", walk_users(systems)),
         "systems": index("hostname", systems),
     }
@@ -257,29 +270,37 @@ def json_diff(a, b) -> str:
     return "\n".join(walk_json_diff(a, b, []))
 
 
-threading.Thread(target=telegram_thread, kwargs=config['telegram'], daemon=True).start()
+def run_daemon():
+    threading.Thread(target=telegram_thread, kwargs=config['telegram'], daemon=True).start()
 
-while True:
-    # работаем в бесконечном цикле в качестве демона
-    try:
-        old = get_storage() or get_jumpcloud_data()
-        while True:
-            # бесконечно сравниваем старое состояние с новым и алертим изменения
-            new = get_jumpcloud_data()
-            diff = json_diff(old, new)
-            if diff:
-                notify(diff)
-                set_storage(new)
-                old = new
+    while True:
+        # работаем в бесконечном цикле в качестве демона
+        try:
+            old = get_storage() or get_jumpcloud_data()
+            while True:
+                # бесконечно сравниваем старое состояние с новым и алертим изменения
+                new = get_jumpcloud_data()
+                diff = json_diff(old, new)
+                if diff:
+                    notify(diff)
+                    set_storage(new)
+                    old = new
 
-            time.sleep(1)
-            logging.debug("--- new cycle ---")
+                time.sleep(1)
+                logging.debug("--- new cycle ---")
 
-    except KeyboardInterrupt:
-        exit(1)
+        except KeyboardInterrupt:
+            exit(1)
 
-    except Exception as e:
-        # не даём программе вылетить, какая бы ошибка не случилась
-        tb = "\n".join(traceback.format_exception(Exception, e, e.__traceback__))
-        logging.critical(tb)
-        alert(e, realert_timeout=60)
+        except Exception as e:
+            # не даём программе вылетить, какая бы ошибка не случилась
+            tb = "\n".join(traceback.format_exception(Exception, e, e.__traceback__))
+            logging.critical(tb)
+
+
+if args.daemon:
+    run_daemon()
+
+else:
+    print(json.dumps(get_jumpcloud_data(), indent=2))
+
